@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
+import * as os from 'os';
 import { PrismaService } from '../prisma/prisma.service';
-import { SoulService } from '../soul/soul.service';
+import { SoulService, SoulContext } from '../soul/soul.service';
 import { SkillsService } from '../skills/skills.service';
 import { LlmFactoryService } from '../llm/llm-factory.service';
 import { SystemExecutorService } from './system-executor.service';
@@ -14,6 +15,8 @@ import {
   ToolResultBlock,
 } from '../common/types/message.types';
 import { isToolUseBlock, isThinkingBlock, isRedactedThinkingBlock } from '../common/utils/type-guards';
+
+const DEFAULT_USER_NAME = 'Harunauts';
 
 const MAX_ITERATIONS = 10;
 
@@ -58,7 +61,8 @@ export class AgentProcessorService {
 
     // ── 4. Build context ───────────────────────────────────
     const skillInstructions = this.skills.getSkillInstructions();
-    const systemPrompt = this.soul.getSystemPrompt(skillInstructions);
+    const soulContext = await this.buildSoulContext(sessionId);
+    const systemPrompt = this.soul.getSystemPrompt(soulContext, skillInstructions);
     const tools = this.skills.getTools();
     const llm = this.llmFactory.getProvider();
 
@@ -223,6 +227,48 @@ export class AgentProcessorService {
   // ══════════════════════════════════════════════════════════
   // ── Private helpers ──────────────────────────────────────
   // ══════════════════════════════════════════════════════════
+
+  /**
+   * Gather runtime context for the Soul system prompt:
+   * resolves user name from DB (via session), sniffs OS/host/node/cwd,
+   * reads active LLM provider, formats current time for humans.
+   */
+  private async buildSoulContext(sessionId: string): Promise<SoulContext> {
+    let userName = DEFAULT_USER_NAME;
+
+    try {
+      const session = await this.prisma.chatSession.findUnique({
+        where: { id: sessionId },
+        include: { user: true },
+      });
+      const dbName = session?.user?.name?.trim();
+      if (dbName) userName = dbName;
+    } catch (err) {
+      this.logger.warn(
+        `Failed to resolve userName from DB, falling back to "${DEFAULT_USER_NAME}": ${err.message}`,
+      );
+    }
+
+    const now = new Date().toLocaleString('en-US', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZoneName: 'short',
+    });
+
+    return {
+      userName,
+      now,
+      os: `${os.platform()} (${os.release()})`,
+      host: os.hostname(),
+      nodeVersion: process.version,
+      cwd: process.cwd(),
+      llmProvider: this.llmFactory.getProviderName(),
+    };
+  }
 
   private async ensureActiveTask(
     sessionId: string,

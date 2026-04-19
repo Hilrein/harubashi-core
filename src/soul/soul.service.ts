@@ -2,6 +2,27 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 
+/**
+ * Runtime context injected into the system prompt on every agent turn.
+ * All fields are required; callers resolve them upstream (see AgentProcessorService).
+ */
+export interface SoulContext {
+  userName: string;
+  now: string;
+  os: string;
+  host: string;
+  nodeVersion: string;
+  cwd: string;
+  llmProvider: string;
+}
+
+/**
+ * Ordered fragments assembled into the final system prompt.
+ * Order matters: identity first, then voice, then hard rules, then tools, then runtime state last.
+ */
+const FRAGMENT_ORDER = ['core', 'voice', 'rules'] as const;
+const RUNTIME_FRAGMENT = 'runtime';
+
 @Injectable()
 export class SoulService implements OnModuleInit {
   private readonly logger = new Logger(SoulService.name);
@@ -16,21 +37,27 @@ export class SoulService implements OnModuleInit {
     this.loadAllPrompts();
   }
 
-  getSystemPrompt(skillInstructions?: string): string {
+  /**
+   * Build the full system prompt for this turn.
+   *
+   * Assembly order:
+   *   core → voice → rules → [tools, if any] → runtime (with ctx injected)
+   */
+  getSystemPrompt(ctx: SoulContext, skillInstructions?: string): string {
+    const vars = this.toTemplateVars(ctx);
     const parts: string[] = [];
 
-    const identity = this.prompts.get('identity');
-    if (identity) parts.push(identity);
-
-    const rules = this.prompts.get('rules');
-    if (rules) parts.push(rules);
-
-    const format = this.prompts.get('format');
-    if (format) parts.push(format);
+    for (const name of FRAGMENT_ORDER) {
+      const raw = this.prompts.get(name);
+      if (raw) parts.push(this.renderTemplate(raw, vars));
+    }
 
     if (skillInstructions?.trim()) {
-      parts.push(`# Tool Instructions\n\n${skillInstructions}`);
+      parts.push(`# Tools\n\n${skillInstructions}`);
     }
+
+    const runtime = this.prompts.get(RUNTIME_FRAGMENT);
+    if (runtime) parts.push(this.renderTemplate(runtime, vars));
 
     return parts.join('\n\n---\n\n');
   }
@@ -40,6 +67,33 @@ export class SoulService implements OnModuleInit {
   }
 
   // ── Private ─────────────────────────────────────────────
+
+  private toTemplateVars(ctx: SoulContext): Record<string, string> {
+    return {
+      USER_NAME: ctx.userName,
+      NOW: ctx.now,
+      OS: ctx.os,
+      HOST: ctx.host,
+      NODE_VERSION: ctx.nodeVersion,
+      CWD: ctx.cwd,
+      LLM_PROVIDER: ctx.llmProvider,
+    };
+  }
+
+  /**
+   * Replace every `{{VAR}}` in the template with the matching entry from `vars`.
+   * Missing keys render as empty string and log a warning — fail-soft by design.
+   */
+  private renderTemplate(
+    template: string,
+    vars: Record<string, string>,
+  ): string {
+    return template.replace(/\{\{(\w+)\}\}/g, (_, key: string) => {
+      if (key in vars) return vars[key];
+      this.logger.warn(`Template variable "${key}" has no value — rendering as empty`);
+      return '';
+    });
+  }
 
   private loadAllPrompts(): void {
     if (!fs.existsSync(this.promptsDir)) {
